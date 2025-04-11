@@ -5,6 +5,7 @@ import platform # For OS detection
 import subprocess
 import time
 from copy import deepcopy
+import struct
 
 import websockets
 import jsonpatch # For applying JSON patches RFC 6902
@@ -18,6 +19,95 @@ INFERENCE_OUTPUT_PATH = "inference_output.json" # Where the model script saves r
 INFERENCE_DELAY_SECONDS = 6
 LOG_LEVEL = logging.INFO
 
+I2C_COMMAND_DELAY_S = 0.002 # Delay in seconds between sending I2C commands (e.g., 2ms)
+
+
+# --- Protocol ID Mappings (Python Side) ---
+
+# Channel IDs:
+# 0-8: Direct Channel Index (0=Master, 1-8=Inputs)
+# 9: soloing_active
+# 10: inferencing_active
+# 11: hw_init_ready
+CH_ID_SOLOING_ACTIVE = 9
+CH_ID_INFERENCING_ACTIVE = 10
+CH_ID_HW_INIT_READY = 11
+
+# Effect IDs (within a channel, index 0-8):
+# 0: Direct Channel Parameters (mute, pan, gain, etc.)
+# 1: Equalizer
+# 2: Compressor
+# 3: Distortion
+# 4: Phaser
+# 5: Reverb
+FX_ID_DIRECT = 0
+FX_ID_EQ = 1
+FX_ID_COMP = 2
+FX_ID_DIST = 3
+FX_ID_PHASER = 4
+FX_ID_REVERB = 5
+
+# Parameter IDs for Direct Channel (FX_ID_DIRECT = 0):
+# Based on order in ChannelParameters definition (mixer_schema.json / mixer_state.h)
+PARAM_ID_DIRECT_MUTED = 0
+PARAM_ID_DIRECT_SOLOED = 1
+PARAM_ID_DIRECT_PANNING = 2
+PARAM_ID_DIRECT_DIGITAL_GAIN = 3
+PARAM_ID_DIRECT_ANALOG_GAIN = 4 # Special handling on STM side
+PARAM_ID_DIRECT_STEREO = 5
+
+# Parameter IDs for Equalizer (FX_ID_EQ = 1):
+PARAM_ID_EQ_ENABLED = 0
+PARAM_ID_EQ_LS_GAIN = 1
+PARAM_ID_EQ_LS_FREQ = 2
+PARAM_ID_EQ_LS_Q = 3
+PARAM_ID_EQ_HS_GAIN = 4
+PARAM_ID_EQ_HS_FREQ = 5
+PARAM_ID_EQ_HS_Q = 6
+PARAM_ID_EQ_B0_GAIN = 7
+PARAM_ID_EQ_B0_FREQ = 8
+PARAM_ID_EQ_B0_Q = 9
+PARAM_ID_EQ_B1_GAIN = 10
+PARAM_ID_EQ_B1_FREQ = 11
+PARAM_ID_EQ_B1_Q = 12
+PARAM_ID_EQ_B2_GAIN = 13
+PARAM_ID_EQ_B2_FREQ = 14
+PARAM_ID_EQ_B2_Q = 15
+PARAM_ID_EQ_B3_GAIN = 16
+PARAM_ID_EQ_B3_FREQ = 17
+PARAM_ID_EQ_B3_Q = 18
+
+# Parameter IDs for Compressor (FX_ID_COMP = 2):
+PARAM_ID_COMP_ENABLED = 0
+PARAM_ID_COMP_THRESH = 1
+PARAM_ID_COMP_RATIO = 2
+PARAM_ID_COMP_ATTACK = 3
+PARAM_ID_COMP_RELEASE = 4
+PARAM_ID_COMP_KNEE = 5
+PARAM_ID_COMP_MAKEUP = 6
+
+# Parameter IDs for Distortion (FX_ID_DIST = 3):
+PARAM_ID_DIST_ENABLED = 0
+PARAM_ID_DIST_DRIVE = 1
+PARAM_ID_DIST_OUTPUT = 2
+
+# Parameter IDs for Phaser (FX_ID_PHASER = 4):
+PARAM_ID_PHASER_ENABLED = 0
+PARAM_ID_PHASER_RATE = 1
+PARAM_ID_PHASER_DEPTH = 2
+
+# Parameter IDs for Reverb (FX_ID_REVERB = 5):
+PARAM_ID_REVERB_ENABLED = 0
+PARAM_ID_REVERB_DECAY = 1
+PARAM_ID_REVERB_WET = 2
+
+# Parameter ID for Top-Level Bool Flags (Channel ID 9-11)
+PARAM_ID_TOPLEVEL_BOOL = 0 # The channel ID itself identifies the flag
+
+# --- End Protocol ID Mappings ---
+
+
+
 # --- I2C Specific Configuration ---
 # For RPi (smbus2)
 PI_I2C_BUS_NUM = 1
@@ -25,10 +115,13 @@ PI_I2C_BUS_NUM = 1
 # Common URLs: 'ftdi://ftdi:232h/1', 'ftdi://::/1'
 FTDI_DEVICE_URL = 'ftdi://ftdi:232h/1'
 # FTDI I2C frequency (optional, defaults usually ok)
-FTDI_I2C_FREQ = 100000 # 100kHz example
+FTDI_I2C_FREQ = 10000 # 100kHz example
 
 # --- Logging Setup ---
 logging.basicConfig(level=LOG_LEVEL, format='%(asctime)s [%(levelname)s] %(message)s')
+
+# --- Global Async Queue for I2C Commands ---
+i2c_command_queue = asyncio.Queue()
 
 # --- I2C Adapter Class ---
 # Provides a consistent interface for different I2C libraries
@@ -201,63 +294,221 @@ async def broadcast_patch(patch_list, *, exclude_client=None):
                 client = list(targets)[i]
                 logging.error(f"Error broadcasting patch to {client.remote_address}: {result}")
 
+# --- Helper for I2C Message Value Encoding ---
+def encode_value(value):
+    """Encodes a Python value (float, bool) into a uint32 integer."""
+    if isinstance(value, bool):
+        return 1 if value else 0
+    elif isinstance(value, (int, float)):
+        # Pack float as 4 bytes, then unpack as uint32
+        try:
+            packed_float = struct.pack('<f', float(value)) # '<f' = little-endian float
+            return struct.unpack('<I', packed_float)[0]    # '<I' = little-endian uint32
+        except (struct.error, TypeError, OverflowError) as e:
+            logging.error(f"Failed to encode value '{value}': {e}")
+            return 0 # Return 0 on error? Or raise?
+    else:
+        logging.warning(f"Unsupported value type for encoding: {type(value)}")
+        return 0
 
-# --- I2C Communication Function (Uses Adapter) ---
-def send_to_stm32(patch):
+
+## --- Updated I2C Communication Function ---
+async def send_to_stm32(patch):
     """
     Encodes and sends relevant state changes over I2C to the STM32
-    using the initialized I2C adapter.
+    using the initialized I2C adapter and the bespoke 16-byte protocol.
     """
     if not I2C_ENABLED or i2c_adapter is None:
-        # logging.debug("I2C disabled or adapter not initialized, skipping STM32 send.")
         return
 
-    # --- !!! IMPLEMENT YOUR PATCH-TO-16-BYTE LOGIC HERE !!! ---
-    # This part remains conceptually the same, but uses the adapter
+    commands_generated = 0
+
     for operation in patch:
+        if operation.get('op') != 'replace':
+            logging.warning(f"Unsupported patch operation for I2C: {operation.get('op')}")
+            continue
+
         path = operation.get('path', '')
         value = operation.get('value')
-        op_type = operation.get('op')
+        parts = path.strip('/').split('/') # e.g., ['channels', '1', 'compressor', 'ratio'] or ['soloing_active']
 
-        if op_type == 'replace':
-            parts = path.strip('/').split('/')
-            if len(parts) >= 3 and parts[0] == 'channels':
-                try:
-                    channel_index = int(parts[1])
+        channel_id = 0
+        effect_id = 0
+        param_id = 0
+        encoded_value = 0
+        valid_command = False
+
+        try:
+            # --- Parse Path and Determine IDs ---
+            if len(parts) == 1: # Top-level parameter
+                param_name = parts[0]
+                param_id = PARAM_ID_TOPLEVEL_BOOL # Parameter ID is trivial here
+                if param_name == 'soloing_active':
+                    channel_id = CH_ID_SOLOING_ACTIVE
+                    valid_command = True
+                elif param_name == 'inferencing_active':
+                    channel_id = CH_ID_INFERENCING_ACTIVE
+                    valid_command = True
+                elif param_name == 'hw_init_ready':
+                    channel_id = CH_ID_HW_INIT_READY
+                    valid_command = True
+
+            elif len(parts) >= 3 and parts[0] == 'channels':
+                channel_id = int(parts[1]) # 0-8
+                if not (0 <= channel_id <= 8): raise ValueError("Invalid channel index")
+
+                if len(parts) == 3: # Direct channel parameter
+                    effect_id = FX_ID_DIRECT
                     param_name = parts[2]
-                    # Further nested parts if needed
+                    if param_name == 'muted': param_id = PARAM_ID_DIRECT_MUTED; valid_command = True
+                    elif param_name == 'soloed': param_id = PARAM_ID_DIRECT_SOLOED; valid_command = True
+                    elif param_name == 'panning': param_id = PARAM_ID_DIRECT_PANNING; valid_command = True
+                    elif param_name == 'digital_gain': param_id = PARAM_ID_DIRECT_DIGITAL_GAIN; valid_command = True
+                    elif param_name == 'analog_gain': param_id = PARAM_ID_DIRECT_ANALOG_GAIN; valid_command = True # Will be handled specially by C
+                    elif param_name == 'stereo': param_id = PARAM_ID_DIRECT_STEREO; valid_command = True
 
-                    # --- TODO: Implement encoding logic ---
-                    # 1. Determine parameter ID/code
-                    # 2. Determine channel ID/code
-                    # 3. Encode 'value'
-                    # 4. Construct 16-byte message (as bytes or bytearray)
-                    # ---
+                elif len(parts) == 4: # Effect enable/disable
+                    effect_name = parts[2]
+                    param_name = parts[3]
+                    if param_name == 'enabled':
+                         if effect_name == 'equalizer': effect_id = FX_ID_EQ; param_id = PARAM_ID_EQ_ENABLED; valid_command = True
+                         elif effect_name == 'compressor': effect_id = FX_ID_COMP; param_id = PARAM_ID_COMP_ENABLED; valid_command = True
+                         elif effect_name == 'distortion': effect_id = FX_ID_DIST; param_id = PARAM_ID_DIST_ENABLED; valid_command = True
+                         elif effect_name == 'phaser': effect_id = FX_ID_PHASER; param_id = PARAM_ID_PHASER_ENABLED; valid_command = True
+                         elif effect_name == 'reverb': effect_id = FX_ID_REVERB; param_id = PARAM_ID_REVERB_ENABLED; valid_command = True
 
-                    # Example: Send a placeholder message
-                    i2c_message_bytes = bytes([channel_index, 0x01, 0x02, 0x03, 0,0,0,0, 0,0,0,0, 0,0,0,0]) # Your 16 bytes
-                    logging.debug(f"I2C Attempt: Sending msg for {path} = {value}")
+                elif len(parts) == 5: # Effect parameter (non-EQ band)
+                    effect_name = parts[2]
+                    param_name = parts[4] # e.g., ratio, drive, rate, decay_time
+                    # Determine Effect ID
+                    if effect_name == 'compressor': effect_id = FX_ID_COMP
+                    elif effect_name == 'distortion': effect_id = FX_ID_DIST
+                    elif effect_name == 'phaser': effect_id = FX_ID_PHASER
+                    elif effect_name == 'reverb': effect_id = FX_ID_REVERB
+                    else: raise ValueError(f"Unknown effect name: {effect_name}")
 
-                    # Use the adapter's write_block method
-                    success = i2c_adapter.write_block(STM32_I2C_ADDR, i2c_message_bytes)
+                    # Determine Parameter ID within Effect
+                    if effect_id == FX_ID_COMP:
+                        if param_name == 'threshold_db': param_id = PARAM_ID_COMP_THRESH; valid_command = True
+                        elif param_name == 'ratio': param_id = PARAM_ID_COMP_RATIO; valid_command = True
+                        elif param_name == 'attack_ms': param_id = PARAM_ID_COMP_ATTACK; valid_command = True
+                        elif param_name == 'release_ms': param_id = PARAM_ID_COMP_RELEASE; valid_command = True
+                        elif param_name == 'knee_db': param_id = PARAM_ID_COMP_KNEE; valid_command = True
+                        elif param_name == 'makeup_gain_db': param_id = PARAM_ID_COMP_MAKEUP; valid_command = True
+                    elif effect_id == FX_ID_DIST:
+                        if param_name == 'drive': param_id = PARAM_ID_DIST_DRIVE; valid_command = True
+                        elif param_name == 'output_gain_db': param_id = PARAM_ID_DIST_OUTPUT; valid_command = True
+                    elif effect_id == FX_ID_PHASER:
+                         if param_name == 'rate': param_id = PARAM_ID_PHASER_RATE; valid_command = True
+                         elif param_name == 'depth': param_id = PARAM_ID_PHASER_DEPTH; valid_command = True
+                    elif effect_id == FX_ID_REVERB:
+                         if param_name == 'decay_time': param_id = PARAM_ID_REVERB_DECAY; valid_command = True
+                         elif param_name == 'wet_level': param_id = PARAM_ID_REVERB_WET; valid_command = True
 
-                    if success:
-                        logging.debug(f"Sent I2C message for {path} via adapter.")
-                    else:
-                        logging.warning(f"Failed to send I2C message for {path} via adapter.")
+                elif len(parts) == 6 and parts[2] == 'equalizer': # EQ Band parameter
+                    effect_id = FX_ID_EQ
+                    band_name = parts[3] # e.g., lowShelf, band0
+                    param_name = parts[5] # e.g., gain_db, cutoff_freq, q_factor
+
+                    # Map band/param name to single EQ param_id
+                    if band_name == 'lowShelf':
+                        if param_name == 'gain_db': param_id = PARAM_ID_EQ_LS_GAIN; valid_command = True
+                        elif param_name == 'cutoff_freq': param_id = PARAM_ID_EQ_LS_FREQ; valid_command = True
+                        elif param_name == 'q_factor': param_id = PARAM_ID_EQ_LS_Q; valid_command = True
+                    elif band_name == 'highShelf':
+                        if param_name == 'gain_db': param_id = PARAM_ID_EQ_HS_GAIN; valid_command = True
+                        elif param_name == 'cutoff_freq': param_id = PARAM_ID_EQ_HS_FREQ; valid_command = True
+                        elif param_name == 'q_factor': param_id = PARAM_ID_EQ_HS_Q; valid_command = True
+                    elif band_name == 'band0':
+                        if param_name == 'gain_db': param_id = PARAM_ID_EQ_B0_GAIN; valid_command = True
+                        elif param_name == 'cutoff_freq': param_id = PARAM_ID_EQ_B0_FREQ; valid_command = True
+                        elif param_name == 'q_factor': param_id = PARAM_ID_EQ_B0_Q; valid_command = True
+                    elif band_name == 'band1':
+                        if param_name == 'gain_db': param_id = PARAM_ID_EQ_B1_GAIN; valid_command = True
+                        elif param_name == 'cutoff_freq': param_id = PARAM_ID_EQ_B1_FREQ; valid_command = True
+                        elif param_name == 'q_factor': param_id = PARAM_ID_EQ_B1_Q; valid_command = True
+                    elif band_name == 'band2':
+                        if param_name == 'gain_db': param_id = PARAM_ID_EQ_B2_GAIN; valid_command = True
+                        elif param_name == 'cutoff_freq': param_id = PARAM_ID_EQ_B2_FREQ; valid_command = True
+                        elif param_name == 'q_factor': param_id = PARAM_ID_EQ_B2_Q; valid_command = True
+                    elif band_name == 'band3':
+                        if param_name == 'gain_db': param_id = PARAM_ID_EQ_B3_GAIN; valid_command = True
+                        elif param_name == 'cutoff_freq': param_id = PARAM_ID_EQ_B3_FREQ; valid_command = True
+                        elif param_name == 'q_factor': param_id = PARAM_ID_EQ_B3_Q; valid_command = True
+
+            # --- Encode Value and Queue Command ---
+            if valid_command:
+                encoded_value = encode_value(value)
+                i2c_message_bytes = struct.pack('<IIII', channel_id, effect_id, param_id, encoded_value)
+                try:
+                    # Put the command onto the queue asynchronously
+                    await i2c_command_queue.put(i2c_message_bytes)
+                    commands_generated += 1
+                    logging.debug(f"Queued I2C Cmd: Path='{path}' -> Chan={channel_id}, Fx={effect_id}, Param={param_id}, EncVal={encoded_value} -> Bytes={list(i2c_message_bytes)}")
+                except asyncio.QueueFull:
+                     # Should not happen with default unbounded queue, but good practice
+                     logging.error("I2C command queue is unexpectedly full!")
+                except Exception as qe:
+                     logging.error(f"Error putting command onto I2C queue: {qe}")
+
+            else:
+                 # Only log if it wasn't just an unhandled path (like intermediate objects)
+                 # This might be noisy, adjust logging level if needed
+                 # logging.warning(f"Could not map path to I2C command: {path}")
+                 pass
+
+        except (ValueError, IndexError, TypeError) as e:
+            logging.error(f"Error parsing path or value for I2C command: {path} - {e}")
+        except Exception as e:
+            logging.error(f"Unexpected error encoding I2C command for path {path}: {e}")
+
+    if commands_generated > 0:
+        logging.debug(f"Queued {commands_generated} I2C command(s) resulting from patch.")
 
 
-                except (ValueError, IndexError) as e:
-                    logging.warning(f"Could not parse I2C path: {path} - {e}")
-            elif path == '/inferencing_active':
-                 logging.debug(f"I2C TODO: Send inferencing_active = {value}")
-                 # i2c_message_bytes = bytes([...])
-                 # i2c_adapter.write_block(STM32_I2C_ADDR, i2c_message_bytes)
-            # Add elif for other top-level params if needed
-        else:
-            logging.warning(f"Unsupported patch operation for I2C: {op_type}")
-    # --- END OF IMPLEMENTATION AREA ---
-    pass
+
+# --- I2C Command Sender Task (Consumer) ---
+async def i2c_sender_task():
+    """
+    Continuously consumes commands from the queue and sends them over I2C
+    with a delay between each command.
+    """
+    logging.info("Starting I2C sender task...")
+    while True:
+        try:
+            # Wait for a command from the queue
+            command_bytes = await i2c_command_queue.get()
+
+            if command_bytes is None: # Sentinel value to stop the task (optional)
+                logging.info("Received stop signal for I2C sender task.")
+                break
+
+            if not I2C_ENABLED or i2c_adapter is None:
+                logging.warning(f"I2C not enabled/ready. Discarding queued command: {list(command_bytes)}")
+                i2c_command_queue.task_done() # Mark task as done even if discarded
+                continue # Skip sending
+
+            # Send the command using the adapter
+            logging.debug(f"I2C Sender Task: Sending command: {list(command_bytes)}")
+            success = i2c_adapter.write_block(STM32_I2C_ADDR, command_bytes)
+
+            if not success:
+                logging.warning(f"I2C Sender Task: Failed to send command: {list(command_bytes)}")
+                # Optional: Implement retry logic here? Or just log and continue.
+
+            # Mark this command as processed in the queue
+            i2c_command_queue.task_done()
+
+            # --- Introduce the delay ---
+            await asyncio.sleep(I2C_COMMAND_DELAY_S)
+
+        except asyncio.CancelledError:
+            logging.info("I2C sender task cancelled.")
+            break # Exit loop if task is cancelled
+        except Exception as e:
+            logging.error(f"Unexpected error in I2C sender task: {e}", exc_info=True)
+            # Avoid continuous error loops - maybe add a small delay on generic error?
+            await asyncio.sleep(1) # Delay before trying to get next item after error
 
 
 ## --- AI Inference Workflow ---
@@ -297,9 +548,9 @@ async def run_inference_workflow():
         if solo_active_update_patch:
              await broadcast_patch(solo_active_update_patch)
         # Send reset flag to STM32
-        send_to_stm32(reset_patch)
+        await send_to_stm32(reset_patch)
         if solo_active_update_patch:
-             send_to_stm32(solo_active_update_patch)
+             await send_to_stm32(solo_active_update_patch)
 
 
         # 3. Run the model script
@@ -333,10 +584,10 @@ async def run_inference_workflow():
 
                 if inference_patch_list:
                     await broadcast_patch(inference_patch_list) # Broadcast TO ALL
-                    send_to_stm32(inference_patch_list)
+                    await send_to_stm32(inference_patch_list)
                 if solo_active_update_patch_inf:
                     await broadcast_patch(solo_active_update_patch_inf) # Broadcast TO ALL
-                    send_to_stm32(solo_active_update_patch_inf)
+                    await send_to_stm32(solo_active_update_patch_inf)
 
             except Exception as e: # ... (error handling unchanged) ...
                  logging.error(f"Error processing inference results: {e}")
@@ -353,7 +604,7 @@ async def run_inference_workflow():
                  try: jsonpatch.apply_patch(MASTER_STATE, cancel_patch, in_place=True)
                  except Exception as e: logging.error(f"Error applying cancel patch: {e}")
              await broadcast_patch(cancel_patch)
-             send_to_stm32(cancel_patch)
+             await send_to_stm32(cancel_patch)
              # Consider also checking/broadcasting soloing_active here if needed
         raise # Re-raise cancellation if needed higher up
     except Exception as e:
@@ -448,9 +699,9 @@ async def handler(websocket, path):
                          await broadcast_patch(solo_active_update_patch) # exclude_client=None
 
                     # 4. Send changes to STM32
-                    send_to_stm32(applied_patch_ops)
+                    await send_to_stm32(applied_patch_ops)
                     if solo_active_update_patch:
-                         send_to_stm32(solo_active_update_patch)
+                         await send_to_stm32(solo_active_update_patch)
 
                     # 5. Handle Inference Trigger / Cancellation
                     if inference_triggered:
@@ -489,20 +740,44 @@ async def handler(websocket, path):
         CONNECTED_CLIENTS.remove(websocket)
 
 
-# --- Main Server Execution ---
+## --- Main Server Execution ---
 async def main():
+    # Start the dedicated I2C sender task
+    sender_task = asyncio.create_task(i2c_sender_task())
+
     # Start the WebSocket server
-    async with websockets.serve(handler, HOST, PORT):
-        logging.info(f"WebSocket server started on ws://{HOST}:{PORT}")
-        logging.info(f"I2C Communication {'ENABLED' if I2C_ENABLED else 'DISABLED'} using adapter type: {i2c_adapter._type if i2c_adapter else 'None'}")
-        await asyncio.Future()  # Run forever
+    try:
+        async with websockets.serve(handler, HOST, PORT):
+            logging.info(f"WebSocket server started on ws://{HOST}:{PORT}")
+            logging.info(f"I2C Communication {'ENABLED' if I2C_ENABLED else 'DISABLED'} using adapter type: {i2c_adapter._type if i2c_adapter else 'None'}")
+            await asyncio.Future()  # Run forever
+    finally:
+        # Ensure sender task is cancelled when server stops
+        logging.info("Shutting down I2C sender task...")
+        if sender_task and not sender_task.done():
+             sender_task.cancel()
+             try:
+                 await sender_task # Wait for cancellation to complete
+             except asyncio.CancelledError:
+                 logging.info("I2C sender task cancellation confirmed.")
+             except Exception as e:
+                 logging.error(f"Error awaiting sender task cancellation: {e}")
+
 
 if __name__ == "__main__":
+    i2c_cleanup_needed = False # Flag to track if adapter needs closing
     try:
+        # Check if adapter was initialized before starting asyncio loop
+        if i2c_adapter:
+            i2c_cleanup_needed = True
         asyncio.run(main())
     except KeyboardInterrupt:
         logging.info("Server stopped by user.")
+    except Exception as e:
+        logging.error(f"Unhandled exception in main execution: {e}", exc_info=True)
     finally:
-        # Cleanup I2C adapter if it was initialized
-        if i2c_adapter:
+        # Cleanup I2C adapter ONLY if it was successfully initialized
+        if i2c_cleanup_needed and i2c_adapter:
+            logging.info("Closing I2C adapter...")
             i2c_adapter.close()
+        logging.info("State manager shutdown complete.")

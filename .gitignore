@@ -1,0 +1,72 @@
+# --- Python Virtual Environment (located in project root) ---
+# Core directories created by venv
+/bin/
+/include/
+/lib/
+/lib64/
+/share/
+# venv configuration file
+/pyvenv.cfg
+# Pip wheel cache (less common directly in root, but just in case)
+/wheels/
+
+# --- Python Cache & Compiled Files ---
+__pycache__/
+*.py[cod]
+*$py.class
+
+# --- Distribution / Packaging ---
+/build/
+/dist/
+/downloads/
+/eggs/
+/*.egg-info/
+/*.egg
+MANIFEST
+
+# --- IDE / Editor / OS Files ---
+# VS Code
+.vscode/
+# PyCharm
+.idea/
+# macOS
+.DS_Store
+# Linux/Vim swap files
+*.swp
+*.swo
+*~
+
+# --- Test & Coverage Output ---
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/
+
+# --- Project Specific Generated Files ---
+
+# Model input tracks (assuming these are generated/temporary)
+# Ignore the whole directory:
+# /model/input_tracks/
+# OR, if you want to keep the directory itself committed but ignore WAVs:
+/model/input_tracks/*.wav
+
+# Model output JSON
+/model/output.json
+
+# Model Checkpoints (often large - consider Git LFS if you need to track them)
+/model/*.ckpt
+
+# Logs (if your scripts generate log files)
+*.log
+logs/
+
+# Environment variables file (if you use one)
+.env*
+!.env.example
+
+# Any specific test outputs if needed
+# /test_outputs/
