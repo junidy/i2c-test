@@ -52,7 +52,7 @@ coverage.xml
 # Ignore the whole directory:
 # /model/input_tracks/
 # OR, if you want to keep the directory itself committed but ignore WAVs:
-/model/input_tracks/*.wav
+# /model/input_tracks/*.wav
 
 # Model output JSON
 /model/output.json

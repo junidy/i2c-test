@@ -4,25 +4,71 @@ import logging
 import platform # For OS detection
 import subprocess
 import time
+import os # Added for path operations and file deletion
+import glob # Added for finding wav files
 from copy import deepcopy
 import struct
 
 import websockets
 import jsonpatch # For applying JSON patches RFC 6902
 
-# --- Configuration ---
+# --- Inferencing Configuration ---
+# --- NEW: Define base directory and relative paths ---
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+MODEL_DIR = os.path.join(BASE_DIR, "model") # Assuming model script is in 'model' subdir
+INPUT_TRACKS_DIR = os.path.join(MODEL_DIR, "input_tracks") # Where teammate puts raw audio
+INFERENCE_SCRIPT_PATH = os.path.join(MODEL_DIR, "inference.py") # Path to the script
+INFERENCE_OUTPUT_DIR = MODEL_DIR # Save output.json in the model dir
+INFERENCE_OUTPUT_FILENAME = "output.json" # Standardized output filename
+DEFAULT_CKPT_FILENAME = "dmc_2.ckpt" # Model checkpoint filename
+MODEL_CKPT_PATH = os.path.join(MODEL_DIR, DEFAULT_CKPT_FILENAME) # Full path to checkpoint
+
+RECORDING_DELAY_SECONDS = 6 # Renamed from INFERENCE_DELAY_SECONDS for clarity
+POST_RECORDING_BUFFER_SECONDS = 1 # Buffer time before processing
+
+# --- I2C Configuration ---
 HOST = '0.0.0.0'  # Listen on all interfaces
 PORT = 8765       # WebSocket port
 STM32_I2C_ADDR = 0x42 # Example I2C address for your STM32
-INFERENCE_SCRIPT_PATH = "your_model_script.py" # Path to your PyTorch model script
-INFERENCE_OUTPUT_PATH = "inference_output.json" # Where the model script saves results
-INFERENCE_DELAY_SECONDS = 6
 LOG_LEVEL = logging.INFO
 
 I2C_COMMAND_DELAY_S = 0.002 # Delay in seconds between sending I2C commands (e.g., 2ms)
 
+# --- Parameter Name Mapping (From Inference Output to Internal State) ---
+# Used when parsing output.json
+PARAM_MAP = {
+    "Gain dB": "digital_gain", # Map external name to internal name
+    "low_shelf_gain_db": "equalizer/lowShelf/gain_db",
+    "low_shelf_cutoff_freq": "equalizer/lowShelf/cutoff_freq",
+    "low_shelf_q_factor": "equalizer/lowShelf/q_factor",
+    "band0_gain_db": "equalizer/band0/gain_db",
+    "band0_cutoff_freq": "equalizer/band0/cutoff_freq",
+    "band0_q_factor": "equalizer/band0/q_factor",
+    "band1_gain_db": "equalizer/band1/gain_db",
+    "band1_cutoff_freq": "equalizer/band1/cutoff_freq",
+    "band1_q_factor": "equalizer/band1/q_factor",
+    "band2_gain_db": "equalizer/band2/gain_db",
+    "band2_cutoff_freq": "equalizer/band2/cutoff_freq",
+    "band2_q_factor": "equalizer/band2/q_factor",
+    "band3_gain_db": "equalizer/band3/gain_db",
+    "band3_cutoff_freq": "equalizer/band3/cutoff_freq",
+    "band3_q_factor": "equalizer/band3/q_factor",
+    "high_shelf_gain_db": "equalizer/highShelf/gain_db",
+    "high_shelf_cutoff_freq": "equalizer/highShelf/cutoff_freq",
+    "high_shelf_q_factor": "equalizer/highShelf/q_factor",
+    "threshold_db": "compressor/threshold_db",
+    "ratio": "compressor/ratio",
+    "attack_ms": "compressor/attack_ms",
+    "release_ms": "compressor/release_ms",
+    "knee_db": "compressor/knee_db",
+    "makeup_gain_db": "compressor/makeup_gain_db",
+    "Pan": "panning", # Map external name to internal name
+}
+# --- End Model JSON Parameter Mapping ---
 
-# --- Protocol ID Mappings (Python Side) ---
+
+
+# --- STM Command Protocol ID Mappings (Python Side) ---
 
 # Channel IDs:
 # 0-8: Direct Channel Index (0=Master, 1-8=Inputs)
@@ -269,12 +315,13 @@ MASTER_STATE = {
     "channels": [create_default_channel(i == 0) for i in range(9)],
     "soloing_active": False,
     "inferencing_active": False,
+    "inferencing_state": "idle", # NEW: idle, countdown, recording, inferencing
     "hw_init_ready": False,
 }
 CONNECTED_CLIENTS = set()
 STATE_LOCK = asyncio.Lock()
 inference_task = None
-
+recording_timer_task = None # NEW: Handle for the 6s recording timer
 
 
 # --- Helper Functions ---
@@ -352,6 +399,9 @@ async def send_to_stm32(patch):
                 elif param_name == 'hw_init_ready':
                     channel_id = CH_ID_HW_INIT_READY
                     valid_command = True
+                elif param_name == 'inferencing_state': # NEW: Ignore sending this specific state string via I2C
+                     valid_command = False # Do not send state string itself
+                # --- Note: inferencing_state is handled implicitly by inferencing_active for STM ---
 
             elif len(parts) >= 3 and parts[0] == 'channels':
                 channel_id = int(parts[1]) # 0-8
@@ -511,111 +561,207 @@ async def i2c_sender_task():
             await asyncio.sleep(1) # Delay before trying to get next item after error
 
 
-## --- AI Inference Workflow ---
+# --- UPDATED AI Inference Workflow ---
 async def run_inference_workflow():
-    """Handles the AI auto-mixing process."""
-    global MASTER_STATE, inference_task
-    logging.info("Starting AI inference workflow...")
+    """Handles the AI auto-mixing process after recording."""
+    global MASTER_STATE, inference_task # Keep inference_task to prevent overlaps
+    logging.info("Starting post-recording inference workflow...")
+
+    # Ensure directories exist
+    if not os.path.exists(INPUT_TRACKS_DIR):
+        logging.error(f"Input tracks directory does not exist: {INPUT_TRACKS_DIR}")
+        # Maybe try to create it? Or just fail.
+        try: os.makedirs(INPUT_TRACKS_DIR)
+        except OSError as e: logging.error(f"Could not create input dir: {e}"); return
+    if not os.path.exists(INFERENCE_OUTPUT_DIR):
+        try: os.makedirs(INFERENCE_OUTPUT_DIR)
+        except OSError as e: logging.error(f"Could not create output dir: {INFERENCE_OUTPUT_DIR}: {e}"); return
+
+    inference_output_json_path = os.path.join(INFERENCE_OUTPUT_DIR, INFERENCE_OUTPUT_FILENAME)
 
     try:
-        # 1. Delay for audio capture
-        await asyncio.sleep(INFERENCE_DELAY_SECONDS)
+        # 1. Buffer Time (Wait for file finalization)
+        logging.info(f"Waiting {POST_RECORDING_BUFFER_SECONDS}s for audio file finalization...")
+        await asyncio.sleep(POST_RECORDING_BUFFER_SECONDS)
 
-        # 2. Reset inferencing_active flag (apply, broadcast TO ALL, send I2C)
-        logging.info(f"Inference capture time ({INFERENCE_DELAY_SECONDS}s) elapsed. Resetting flag.")
-        reset_patch = [{"op": "replace", "path": "/inferencing_active", "value": False}]
-        solo_active_update_patch = None # Track if soloing needs update too
-        async with STATE_LOCK:
-            try:
-                if MASTER_STATE['inferencing_active']: # Only apply/broadcast if still true
-                    jsonpatch.apply_patch(MASTER_STATE, reset_patch, in_place=True)
-                    # Check if soloing_active needs recalculation after any state change
-                    current_soloing = MASTER_STATE['soloing_active']
-                    new_soloing = any(ch['soloed'] for ch in MASTER_STATE['channels'])
-                    if new_soloing != current_soloing:
-                        MASTER_STATE['soloing_active'] = new_soloing
-                        solo_active_update_patch = [{"op": "replace", "path": "/soloing_active", "value": new_soloing}]
+        # 2. Delete Muted Tracks
+        logging.info("Deleting muted tracks before inference...")
+        deleted_count = 0
+        async with STATE_LOCK: # Need current mute state
+            muted_channels = {
+                i for i, ch in enumerate(MASTER_STATE['channels'])
+                if i >= 1 and i <= 8 and ch['muted'] # Only check input channels 1-8
+            }
+        logging.debug(f"Channels marked as muted: {muted_channels}")
 
-            except asyncio.CancelledError:
-                 logging.info("Inference workflow cancelled before flag reset.")
-                 raise # Re-raise cancellation
-            except Exception as e:
-                 logging.error(f"Error applying inference reset patch: {e}")
+        for i in range(1, 9): # Iterate through physical input channels 1-8
+            if i in muted_channels:
+                track_filename = f"{i}.wav"
+                track_filepath = os.path.join(INPUT_TRACKS_DIR, track_filename)
+                if os.path.exists(track_filepath):
+                    try:
+                        os.remove(track_filepath)
+                        logging.info(f"  - Deleted muted track file: {track_filepath}")
+                        deleted_count += 1
+                    except OSError as e:
+                        logging.error(f"  - Failed to delete muted track file {track_filepath}: {e}")
+                # else: # Optional: Log if muted track file wasn't found anyway
+                #    logging.debug(f"  - Muted track file not found (already gone?): {track_filepath}")
 
-        # Broadcast reset flag TO ALL clients
-        await broadcast_patch(reset_patch) # Uses helper, exclude_client=None
-        # Broadcast soloing update if needed
-        if solo_active_update_patch:
-             await broadcast_patch(solo_active_update_patch)
-        # Send reset flag to STM32
-        await send_to_stm32(reset_patch)
-        if solo_active_update_patch:
-             await send_to_stm32(solo_active_update_patch)
+        logging.info(f"Finished deleting {deleted_count} muted track(s).")
 
 
-        # 3. Run the model script
-        # ... (subprocess logic unchanged) ...
-        logging.info(f"Running inference script: {INFERENCE_SCRIPT_PATH}...")
+        # 3. Construct and Run the inference.py Script
+        cmd = [
+            'python', # Or specific python executable if needed e.g., sys.executable
+            INFERENCE_SCRIPT_PATH,
+            '--track_dir', INPUT_TRACKS_DIR,
+            '--output_dir', INFERENCE_OUTPUT_DIR, # Tells script where to write output.json
+            '--ckpt_path', MODEL_CKPT_PATH
+            # No --song needed if using fixed output filename
+        ]
+        logging.info(f"Running inference script: {' '.join(cmd)}")
         process = await asyncio.create_subprocess_exec(
-            'python', INFERENCE_SCRIPT_PATH,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+            *cmd, # Unpack command list
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=MODEL_DIR # <-- ADD THIS LINE
         )
         stdout, stderr = await process.communicate()
 
-        # 4. Parse output, generate/apply/broadcast/send patch
-        if process.returncode == 0:
-            # ... (parsing logic unchanged) ...
-            try:
-                with open(INFERENCE_OUTPUT_PATH, 'r') as f: inferred_params = json.load(f)
-                inference_patch_list = None
-                solo_active_update_patch_inf = None
+        stdout_decoded = stdout.decode().strip() if stdout else ""
+        stderr_decoded = stderr.decode().strip() if stderr else ""
+
+        if stdout_decoded: logging.info(f"Inference script stdout:\n---\n{stdout_decoded}\n---")
+        if stderr_decoded: logging.warning(f"Inference script stderr:\n---\n{stderr_decoded}\n---")
+
+        # 4. Check Return Code & Parse Output
+        if process.returncode != 0:
+            logging.error(f"Inference script failed with return code {process.returncode}.")
+            # Don't apply results, just transition state back to idle below
+            raise ChildProcessError("Inference script failed.")
+
+        logging.info(f"Inference script completed. Parsing {inference_output_json_path}...")
+        try:
+            with open(inference_output_json_path, 'r') as f:
+                inferred_results = json.load(f)
+
+            if "tracks" not in inferred_results or not isinstance(inferred_results["tracks"], dict):
+                 logging.error("Invalid format in output.json: Missing or invalid 'tracks' key.")
+                 raise ValueError("Invalid inference output format")
+
+            # 5. Generate JSON Patch from Parsed Results
+            inference_patch_list = []
+            processed_channels = set() # Keep track of channels we got results for
+
+            for channel_idx_str, params in inferred_results["tracks"].items():
+                try:
+                    channel_index = int(channel_idx_str) # Convert string key "1", "3" etc. to int
+                    if not (1 <= channel_index <= 8): # Validate range
+                        logging.warning(f"Skipping inference results for invalid channel index: {channel_idx_str}")
+                        continue
+                    processed_channels.add(channel_index)
+
+                    # --- Map parameters to JSON Patch operations ---
+                    for json_key, internal_path_suffix in PARAM_MAP.items():
+                        if json_key in params:
+                            patch_path = f"/channels/{channel_index}/{internal_path_suffix}"
+                            inference_patch_list.append({
+                                "op": "replace",
+                                "path": patch_path,
+                                "value": params[json_key] # Use the value directly from JSON
+                            })
+                        # else: # Optional: Log if expected param is missing in output
+                        #    logging.debug(f"Param '{json_key}' not found in inference output for channel {channel_index}")
+
+                    # --- Enable EQ and Compressor for processed channels ---
+                    # Assuming model always provides settings for these if it processes a track
+                    inference_patch_list.append({"op": "replace", "path": f"/channels/{channel_index}/equalizer/enabled", "value": True})
+                    inference_patch_list.append({"op": "replace", "path": f"/channels/{channel_index}/compressor/enabled", "value": True})
+
+                except ValueError:
+                     logging.warning(f"Skipping inference results for non-integer channel key: {channel_idx_str}")
+                except Exception as e:
+                     logging.error(f"Error processing inference results for channel {channel_idx_str}: {e}")
+
+            # --- Reset other effects (Dist, Phaser, Reverb) for PROCESSED channels ---
+            for channel_index in processed_channels:
+                 logging.debug(f"Resetting Distortion/Phaser/Reverb for processed channel {channel_index}")
+                 inference_patch_list.append({"op": "replace", "path": f"/channels/{channel_index}/distortion/enabled", "value": False})
+                 inference_patch_list.append({"op": "replace", "path": f"/channels/{channel_index}/phaser/enabled", "value": False})
+                 # Reverb only applies to master, which isn't processed by inference, so no need to reset here
+                 # if channel_index == 0: # If master was somehow processed
+                 #    inference_patch_list.append({"op": "replace", "path": f"/channels/0/reverb/enabled", "value": False}) # Example
+
+            logging.info(f"Generated {len(inference_patch_list)} patch operations from inference.")
+
+            # 6. Apply, Broadcast, Send to STM32
+            if inference_patch_list:
+                final_solo_patch = None
                 async with STATE_LOCK:
-                    # ... (make_patch logic unchanged) ...
-                    inference_patch = jsonpatch.make_patch(MASTER_STATE, inferred_params)
-                    inference_patch_list = inference_patch.patch
-                    if inference_patch_list:
+                    try:
                         jsonpatch.apply_patch(MASTER_STATE, inference_patch_list, in_place=True)
-                        # Check soloing_active again after inference patch
+                        # Check solo status again after applying patch
                         current_soloing = MASTER_STATE['soloing_active']
                         new_soloing = any(ch['soloed'] for ch in MASTER_STATE['channels'])
                         if new_soloing != current_soloing:
                             MASTER_STATE['soloing_active'] = new_soloing
-                            solo_active_update_patch_inf = [{"op": "replace", "path": "/soloing_active", "value": new_soloing}]
+                            final_solo_patch = [{"op": "replace", "path": "/soloing_active", "value": new_soloing}]
+                    except Exception as e:
+                        logging.error(f"Error applying inference patch list: {e}")
+                        raise # Re-raise to trigger outer error handling
 
-                if inference_patch_list:
-                    await broadcast_patch(inference_patch_list) # Broadcast TO ALL
-                    await send_to_stm32(inference_patch_list)
-                if solo_active_update_patch_inf:
-                    await broadcast_patch(solo_active_update_patch_inf) # Broadcast TO ALL
-                    await send_to_stm32(solo_active_update_patch_inf)
+                # Broadcast inference results (TO ALL)
+                await broadcast_patch(inference_patch_list)
+                await send_to_stm32(inference_patch_list) # Send inference commands
 
-            except Exception as e: # ... (error handling unchanged) ...
-                 logging.error(f"Error processing inference results: {e}")
-        else: # ... (script failure handling unchanged) ...
-            logging.error(f"Inference script failed...")
+                # Broadcast solo update if needed (TO ALL)
+                if final_solo_patch:
+                    await broadcast_patch(final_solo_patch)
+                    await send_to_stm32(final_solo_patch)
 
-    except asyncio.CancelledError:
-        logging.info("AI inference workflow cancelled.")
-        # Ensure flag is false if cancelled mid-way
-        if MASTER_STATE.get('inferencing_active', False):
-             logging.warning("Workflow cancelled but flag might still be true. Forcing false.")
-             cancel_patch = [{"op": "replace", "path": "/inferencing_active", "value": False}]
-             async with STATE_LOCK: # Ensure state consistency
-                 try: jsonpatch.apply_patch(MASTER_STATE, cancel_patch, in_place=True)
-                 except Exception as e: logging.error(f"Error applying cancel patch: {e}")
-             await broadcast_patch(cancel_patch)
-             await send_to_stm32(cancel_patch)
-             # Consider also checking/broadcasting soloing_active here if needed
-        raise # Re-raise cancellation if needed higher up
-    except Exception as e:
-        logging.error(f"Unexpected error in inference workflow: {e}")
+        except FileNotFoundError:
+            logging.error(f"Inference output file not found: {inference_output_json_path}")
+            raise # Propagate error
+        except json.JSONDecodeError:
+            logging.error(f"Failed to parse JSON from inference output file: {inference_output_json_path}")
+            raise # Propagate error
+        except Exception as e:
+            logging.error(f"Unexpected error processing inference results: {e}")
+            raise # Propagate error
+
+    except (asyncio.CancelledError, ChildProcessError, ValueError, FileNotFoundError, json.JSONDecodeError, Exception) as e:
+        # Catch specific errors from above and general errors
+        if isinstance(e, asyncio.CancelledError):
+             logging.info("AI inference workflow cancelled.")
+             # State cleanup might be handled by the caller that cancelled it
+        else:
+            logging.error(f"Error during inference workflow: {e}")
+        # Fall through to finally block for state reset
+
     finally:
-        logging.info("AI inference workflow finished.")
-        inference_task = None
+        logging.info("AI inference workflow concluding.")
+        # 7. Reset inferencing_state back to "idle" REGARDLESS of success/failure/cancel
+        # Ensure state/active flags are consistent
+        final_state_patch = []
+        async with STATE_LOCK:
+            if MASTER_STATE['inferencing_state'] != "idle":
+                 final_state_patch.append({"op": "replace", "path": "/inferencing_state", "value": "idle"})
+                 MASTER_STATE['inferencing_state'] = "idle"
+            if MASTER_STATE['inferencing_active']: # Ensure active is also false
+                 final_state_patch.append({"op": "replace", "path": "/inferencing_active", "value": False})
+                 MASTER_STATE['inferencing_active'] = False
+
+        if final_state_patch:
+            await broadcast_patch(final_state_patch) # Notify UIs state is idle
+            await send_to_stm32(final_state_patch) # Ensure STM gets active=false if it wasn't already
+
+        # Clean up the global task handle
+        inference_task = None # Allow another run
 
 ## --- WebSocket Handler ---
 async def handler(websocket, path):
-    global MASTER_STATE, inference_task
+    global MASTER_STATE, inference_task, recording_timer_task
     client_addr = websocket.remote_address
     logging.info(f"Client connected: {client_addr} on path '{path}'")
     CONNECTED_CLIENTS.add(websocket)
@@ -635,8 +781,7 @@ async def handler(websocket, path):
 
                 applied_patch_ops = [] # Store ops that actually changed state
                 solo_status_potentially_changed = False
-                inference_triggered = False
-                inference_cancelled_by_client = False
+                inference_state_change_op = None # Track specific inference state change
 
                 # --- Apply patch and check for specific changes ---
                 async with STATE_LOCK:
@@ -660,12 +805,10 @@ async def handler(websocket, path):
                                 if op_path.startswith("/channels/") and op_path.endswith("/soloed"):
                                     solo_status_potentially_changed = True
 
-                                # Check for inference start/stop trigger from client
-                                if op_path == "/inferencing_active":
-                                    if op_value is True:
-                                        inference_triggered = True
-                                    else: # op_value is False
-                                        inference_cancelled_by_client = True
+                                # --- Track INFERENCING_STATE change ---
+                                if op_path == "/inferencing_state":
+                                    inference_state_change_op = op # Store the whole operation dict
+                                # --- End Tracking ---
 
                         else:
                              logging.debug(f"Patch from {client_addr} resulted in no state change.")
@@ -703,26 +846,62 @@ async def handler(websocket, path):
                     if solo_active_update_patch:
                          await send_to_stm32(solo_active_update_patch)
 
-                    # 5. Handle Inference Trigger / Cancellation
-                    if inference_triggered:
-                        if inference_task and not inference_task.done():
-                            logging.warning("Inference already running, ignoring trigger.")
-                        else:
-                            logging.info("Inference triggered by client patch.")
-                            inference_task = asyncio.create_task(run_inference_workflow())
-                    elif inference_cancelled_by_client:
-                        if inference_task and not inference_task.done():
-                            logging.info("Inference manually cancelled by client.")
-                            inference_task.cancel()
-                            # Workflow's finally/except CancelledError handles state/broadcast
-                        else:
-                            logging.info("Client requested inference cancel, but no task was running.")
-                            # Ensure flag is false if somehow client sent false without task running
-                            if MASTER_STATE.get('inferencing_active', False):
-                                 cancel_patch = [{"op": "replace", "path": "/inferencing_active", "value": False}]
-                                 async with STATE_LOCK: jsonpatch.apply_patch(MASTER_STATE, cancel_patch, in_place=True)
-                                 await broadcast_patch(cancel_patch, exclude_client=websocket) # Inform others
-                                 send_to_stm32(cancel_patch)
+# 5. Handle Inference State Transitions triggered by CLIENT
+                    if inference_state_change_op:
+                        new_inference_state = inference_state_change_op.get("value")
+                        logging.info(f"Client {client_addr} set inferencing_state to: {new_inference_state}")
+
+                        if new_inference_state == "countdown":
+                           # If entering countdown, cancel any potentially running tasks first
+                           if recording_timer_task and not recording_timer_task.done():
+                                logging.warning("Client started countdown, cancelling existing recording timer.")
+                                recording_timer_task.cancel()
+                                recording_timer_task = None
+                           if inference_task and not inference_task.done():
+                                logging.warning("Client started countdown, cancelling existing inference task.")
+                                inference_task.cancel()
+                                inference_task = None
+                           # Ensure active is false if starting countdown
+                           if MASTER_STATE.get('inferencing_active', False):
+                               cancel_active_patch = [{"op": "replace", "path": "/inferencing_active", "value": False}]
+                               async with STATE_LOCK: MASTER_STATE['inferencing_active'] = False
+                               await broadcast_patch(cancel_active_patch)
+                               await send_to_stm32(cancel_active_patch)
+
+                        elif new_inference_state == "recording":
+                            # Cancel any existing timer (redundant safety)
+                            if recording_timer_task and not recording_timer_task.done():
+                                 recording_timer_task.cancel()
+                                 recording_timer_task = None # Clear handle
+
+                            # Check if main inference task is somehow running - should ideally not happen
+                            if inference_task and not inference_task.done():
+                                 logging.warning("Client triggered 'recording' but main inference task is running. Cancelling main task.")
+                                 inference_task.cancel()
+                                 inference_task = None
+
+                            # Set active = True and start timer
+                            active_patch = [{"op": "replace", "path": "/inferencing_active", "value": True}]
+                            async with STATE_LOCK: MASTER_STATE['inferencing_active'] = True
+                            await broadcast_patch(active_patch)
+                            await send_to_stm32(active_patch)
+                            # *** Assign to GLOBAL variable ***
+                            recording_timer_task = asyncio.create_task(recording_timer_complete())
+
+                        elif new_inference_state == "idle": # Client cancel
+                             if recording_timer_task and not recording_timer_task.done():
+                                  logging.info("Client set state to idle, cancelling recording timer.")
+                                  recording_timer_task.cancel()
+                                  recording_timer_task = None # Clear handle
+                             if inference_task and not inference_task.done():
+                                  logging.info("Client set state to idle, cancelling inference task.")
+                                  inference_task.cancel()
+                                  inference_task = None # Clear handle
+                             if MASTER_STATE.get('inferencing_active', False):
+                                 cancel_active_patch = [{"op": "replace", "path": "/inferencing_active", "value": False}]
+                                 async with STATE_LOCK: MASTER_STATE['inferencing_active'] = False
+                                 await broadcast_patch(cancel_active_patch)
+                                 await send_to_stm32(cancel_active_patch)
 
             except json.JSONDecodeError: # ... (rest of error handling unchanged) ...
                 logging.warning(f"Could not decode JSON from {client_addr}: {message}")
@@ -738,6 +917,74 @@ async def handler(websocket, path):
     finally: # ... (rest of connection closing unchanged) ...
         logging.info(f"Removing client: {client_addr}")
         CONNECTED_CLIENTS.remove(websocket)
+        # If the last client disconnects, maybe cancel ongoing inference/recording?
+        # if not CONNECTED_CLIENTS:
+        #    if recording_timer_task and not recording_timer_task.done(): recording_timer_task.cancel()
+        #    if inference_task and not inference_task.done(): inference_task.cancel()
+
+# --- NEW: Separate Task for Recording Timer ---
+async def recording_timer_complete():
+    """Waits 6 seconds, then transitions state from 'recording' to 'inferencing'."""
+    global MASTER_STATE, inference_task, recording_timer_task # Declare globals
+    try:
+        logging.info(f"Recording timer started ({RECORDING_DELAY_SECONDS}s)...")
+        await asyncio.sleep(RECORDING_DELAY_SECONDS)
+
+        logging.info("Recording timer finished.")
+        # --- Prepare state transition patches ---
+        state_transition_patch = []
+        active_flag_patch = []
+        solo_update_patch = None
+
+        async with STATE_LOCK:
+            # Only proceed if we are still in the 'recording' state
+            if MASTER_STATE['inferencing_state'] == "recording":
+                logging.info("Transitioning state from 'recording' to 'inferencing'")
+                MASTER_STATE['inferencing_state'] = "inferencing"
+                state_transition_patch.append({"op": "replace", "path": "/inferencing_state", "value": "inferencing"})
+
+                # Set active flag to false
+                if MASTER_STATE['inferencing_active']: # Should be true, but check
+                    MASTER_STATE['inferencing_active'] = False
+                    active_flag_patch.append({"op": "replace", "path": "/inferencing_active", "value": False})
+
+                # Double check solo status (though unlikely to change here)
+                current_soloing = MASTER_STATE['soloing_active']
+                new_soloing = any(ch['soloed'] for ch in MASTER_STATE['channels'])
+                if new_soloing != current_soloing:
+                    MASTER_STATE['soloing_active'] = new_soloing
+                    solo_update_patch = [{"op": "replace", "path": "/soloing_active", "value": new_soloing}]
+            else:
+                 logging.warning(f"Recording timer finished, but state was already '{MASTER_STATE['inferencing_state']}'. No action taken.")
+                 recording_timer_task = None # Clear task handle
+                 return # Exit if state changed (e.g., cancelled)
+
+        # --- Broadcast and Send I2C (outside lock) ---
+        if state_transition_patch: await broadcast_patch(state_transition_patch) # Notify UIs of state change
+        if active_flag_patch:
+             await broadcast_patch(active_flag_patch) # Notify ALL of active=false
+             await send_to_stm32(active_flag_patch) # Send active=false to STM
+        if solo_update_patch:
+             await broadcast_patch(solo_update_patch)
+             await send_to_stm32(solo_update_patch)
+
+        # --- Trigger the main inference workflow ---
+        # Check if another inference isn't somehow already running
+        if inference_task and not inference_task.done():
+             logging.warning("Recording timer finished, but inference task seems to be already running. Not starting another.")
+        else:
+             logging.info("Recording timer finished, starting main inference workflow task.")
+             inference_task = asyncio.create_task(run_inference_workflow())
+
+    except asyncio.CancelledError:
+        logging.info("Recording timer task cancelled.")
+        # No need to reset flags here, the cancelling code should handle it
+        # Or the main workflow's finally block will catch it if state is weird
+    except Exception as e:
+        logging.error(f"Error in recording timer task: {e}")
+        # Consider resetting state to idle here as a fallback?
+    finally:
+         recording_timer_task = None # Clear task handle
 
 
 ## --- Main Server Execution ---
