@@ -8,7 +8,6 @@ import os # Added for path operations and file deletion
 import glob # Added for finding wav files
 from copy import deepcopy
 import struct
-
 import websockets
 import jsonpatch # For applying JSON patches RFC 6902
 
@@ -161,7 +160,7 @@ PI_I2C_BUS_NUM = 1
 # Common URLs: 'ftdi://ftdi:232h/1', 'ftdi://::/1'
 FTDI_DEVICE_URL = 'ftdi://ftdi:232h/1'
 # FTDI I2C frequency (optional, defaults usually ok)
-FTDI_I2C_FREQ = 10000 # 100kHz example
+FTDI_I2C_FREQ = 100000 # 100kHz example
 
 # --- Logging Setup ---
 logging.basicConfig(level=LOG_LEVEL, format='%(asctime)s [%(levelname)s] %(message)s')
@@ -359,161 +358,290 @@ def encode_value(value):
         return 0
 
 
-## --- Updated I2C Communication Function ---
+# --- Helper for I2C Message Value Encoding ---
+def encode_value(value):
+    """Encodes a Python value (float, bool) into a uint32 integer."""
+    if isinstance(value, bool):
+        return 1 if value else 0
+    elif isinstance(value, (int, float)):
+        try:
+            # Use '<' for little-endian, 'f' for 32-bit float, 'I' for unsigned 32-bit int
+            return struct.unpack('<I', struct.pack('<f', float(value)))[0]
+        except (struct.error, TypeError, OverflowError) as e:
+            logging.error(f"Failed to encode value '{value}' as float->uint32: {e}")
+            return 0 # Return 0 on error? Or raise?
+    else:
+        logging.warning(f"Unsupported value type for I2C encoding: {type(value)}")
+        return 0
+
+# --- send_to_stm32 Function (Cleaned Up Version) ---
 async def send_to_stm32(patch):
     """
-    Encodes and sends relevant state changes over I2C to the STM32
-    using the initialized I2C adapter and the bespoke 16-byte protocol.
+    Encodes state changes from a patch into 16-byte commands
+    and puts them onto the asynchronous I2C command queue.
     """
     if not I2C_ENABLED or i2c_adapter is None:
+        # logging.debug("I2C disabled or adapter not init, skipping command generation.")
         return
 
     commands_generated = 0
-
     for operation in patch:
+        # Only process 'replace' operations for this protocol
         if operation.get('op') != 'replace':
-            logging.warning(f"Unsupported patch operation for I2C: {operation.get('op')}")
+            # logging.warning(f"Skipping unsupported patch op for I2C: {operation.get('op')}")
             continue
 
         path = operation.get('path', '')
         value = operation.get('value')
-        parts = path.strip('/').split('/') # e.g., ['channels', '1', 'compressor', 'ratio'] or ['soloing_active']
+        parts = path.strip('/').split('/')
 
+        # Initialize variables for each operation
         channel_id = 0
-        effect_id = 0
-        param_id = 0
-        encoded_value = 0
-        valid_command = False
+        effect_id = 0xFF # Use an invalid default to catch errors
+        param_id = 0xFF   # Use an invalid default
+        valid_command = False # Default to invalid
 
         try:
-            # --- Parse Path and Determine IDs ---
-            if len(parts) == 1: # Top-level parameter
+            num_parts = len(parts)
+
+            # --- Parse Path and Determine IDs based on path structure ---
+
+            # 1. Top-level parameters (e.g., /soloing_active)
+            if num_parts == 1:
                 param_name = parts[0]
-                param_id = PARAM_ID_TOPLEVEL_BOOL # Parameter ID is trivial here
-                if param_name == 'soloing_active':
-                    channel_id = CH_ID_SOLOING_ACTIVE
-                    valid_command = True
-                elif param_name == 'inferencing_active':
-                    channel_id = CH_ID_INFERENCING_ACTIVE
-                    valid_command = True
-                elif param_name == 'hw_init_ready':
-                    channel_id = CH_ID_HW_INIT_READY
-                    valid_command = True
-                elif param_name == 'inferencing_state': # NEW: Ignore sending this specific state string via I2C
-                     valid_command = False # Do not send state string itself
-                # --- Note: inferencing_state is handled implicitly by inferencing_active for STM ---
+                param_id = PARAM_ID_TOPLEVEL_BOOL # Shared param ID for top-level bools
+                effect_id = 0 # Effect not applicable, use 0
+                if param_name == 'soloing_active': channel_id = CH_ID_SOLOING_ACTIVE; valid_command = True
+                elif param_name == 'inferencing_active': channel_id = CH_ID_INFERENCING_ACTIVE; valid_command = True
+                elif param_name == 'hw_init_ready': channel_id = CH_ID_HW_INIT_READY; valid_command = True
+                # 'inferencing_state' is deliberately ignored for I2C
 
-            elif len(parts) >= 3 and parts[0] == 'channels':
-                channel_id = int(parts[1]) # 0-8
-                if not (0 <= channel_id <= 8): raise ValueError("Invalid channel index")
+            # 2. Channel-level parameters (/channels/X/...)
+            elif num_parts >= 3 and parts[0] == 'channels':
+                channel_id = int(parts[1])
+                if not (0 <= channel_id <= 8): raise ValueError(f"Invalid channel index: {channel_id}")
+                effect_name = parts[2] # Potential effect name or direct param name
 
-                if len(parts) == 3: # Direct channel parameter
+                # 2a. Direct channel parameters (/channels/X/paramName) - num_parts == 3
+                if num_parts == 3:
                     effect_id = FX_ID_DIRECT
-                    param_name = parts[2]
+                    param_name = effect_name # In this case, parts[2] is the param name
                     if param_name == 'muted': param_id = PARAM_ID_DIRECT_MUTED; valid_command = True
                     elif param_name == 'soloed': param_id = PARAM_ID_DIRECT_SOLOED; valid_command = True
                     elif param_name == 'panning': param_id = PARAM_ID_DIRECT_PANNING; valid_command = True
                     elif param_name == 'digital_gain': param_id = PARAM_ID_DIRECT_DIGITAL_GAIN; valid_command = True
-                    elif param_name == 'analog_gain': param_id = PARAM_ID_DIRECT_ANALOG_GAIN; valid_command = True # Will be handled specially by C
+                    elif param_name == 'analog_gain': param_id = PARAM_ID_DIRECT_ANALOG_GAIN; valid_command = True
                     elif param_name == 'stereo': param_id = PARAM_ID_DIRECT_STEREO; valid_command = True
 
-                elif len(parts) == 4: # Effect enable/disable
-                    effect_name = parts[2]
-                    param_name = parts[3]
+                # 2b. Effect enable/disable (/channels/X/effectName/enabled) - num_parts == 4
+                elif num_parts == 4:
+                    param_name = parts[3] # Parameter name ('enabled') is at index 3
                     if param_name == 'enabled':
-                         if effect_name == 'equalizer': effect_id = FX_ID_EQ; param_id = PARAM_ID_EQ_ENABLED; valid_command = True
-                         elif effect_name == 'compressor': effect_id = FX_ID_COMP; param_id = PARAM_ID_COMP_ENABLED; valid_command = True
-                         elif effect_name == 'distortion': effect_id = FX_ID_DIST; param_id = PARAM_ID_DIST_ENABLED; valid_command = True
-                         elif effect_name == 'phaser': effect_id = FX_ID_PHASER; param_id = PARAM_ID_PHASER_ENABLED; valid_command = True
-                         elif effect_name == 'reverb': effect_id = FX_ID_REVERB; param_id = PARAM_ID_REVERB_ENABLED; valid_command = True
+                        if effect_name == 'equalizer': effect_id = FX_ID_EQ; param_id = PARAM_ID_EQ_ENABLED; valid_command = True
+                        elif effect_name == 'compressor': effect_id = FX_ID_COMP; param_id = PARAM_ID_COMP_ENABLED; valid_command = True
+                        elif effect_name == 'distortion': effect_id = FX_ID_DIST; param_id = PARAM_ID_DIST_ENABLED; valid_command = True
+                        elif effect_name == 'phaser': effect_id = FX_ID_PHASER; param_id = PARAM_ID_PHASER_ENABLED; valid_command = True
+                        elif effect_name == 'reverb': effect_id = FX_ID_REVERB; param_id = PARAM_ID_REVERB_ENABLED; valid_command = True
 
-                elif len(parts) == 5: # Effect parameter (non-EQ band)
-                    effect_name = parts[2]
-                    param_name = parts[4] # e.g., ratio, drive, rate, decay_time
-                    # Determine Effect ID
-                    if effect_name == 'compressor': effect_id = FX_ID_COMP
-                    elif effect_name == 'distortion': effect_id = FX_ID_DIST
-                    elif effect_name == 'phaser': effect_id = FX_ID_PHASER
-                    elif effect_name == 'reverb': effect_id = FX_ID_REVERB
-                    else: raise ValueError(f"Unknown effect name: {effect_name}")
-
-                    # Determine Parameter ID within Effect
-                    if effect_id == FX_ID_COMP:
+                # 2c. Effect parameter (Comp, Dist, Phaser, Reverb) (/channels/X/effectName/paramName) - num_parts == 5
+                elif num_parts == 5:
+                    param_name = parts[4] # Specific parameter is at index 4
+                    if effect_name == 'compressor':
+                        effect_id = FX_ID_COMP
                         if param_name == 'threshold_db': param_id = PARAM_ID_COMP_THRESH; valid_command = True
                         elif param_name == 'ratio': param_id = PARAM_ID_COMP_RATIO; valid_command = True
                         elif param_name == 'attack_ms': param_id = PARAM_ID_COMP_ATTACK; valid_command = True
                         elif param_name == 'release_ms': param_id = PARAM_ID_COMP_RELEASE; valid_command = True
                         elif param_name == 'knee_db': param_id = PARAM_ID_COMP_KNEE; valid_command = True
                         elif param_name == 'makeup_gain_db': param_id = PARAM_ID_COMP_MAKEUP; valid_command = True
-                    elif effect_id == FX_ID_DIST:
+                    elif effect_name == 'distortion':
+                        effect_id = FX_ID_DIST
                         if param_name == 'drive': param_id = PARAM_ID_DIST_DRIVE; valid_command = True
                         elif param_name == 'output_gain_db': param_id = PARAM_ID_DIST_OUTPUT; valid_command = True
-                    elif effect_id == FX_ID_PHASER:
+                    elif effect_name == 'phaser':
+                         effect_id = FX_ID_PHASER
                          if param_name == 'rate': param_id = PARAM_ID_PHASER_RATE; valid_command = True
                          elif param_name == 'depth': param_id = PARAM_ID_PHASER_DEPTH; valid_command = True
-                    elif effect_id == FX_ID_REVERB:
+                    elif effect_name == 'reverb':
+                         effect_id = FX_ID_REVERB
                          if param_name == 'decay_time': param_id = PARAM_ID_REVERB_DECAY; valid_command = True
                          elif param_name == 'wet_level': param_id = PARAM_ID_REVERB_WET; valid_command = True
+                    # Note: No else needed, if effect_name doesn't match, valid_command stays false
 
-                elif len(parts) == 6 and parts[2] == 'equalizer': # EQ Band parameter
-                    effect_id = FX_ID_EQ
-                    band_name = parts[3] # e.g., lowShelf, band0
-                    param_name = parts[5] # e.g., gain_db, cutoff_freq, q_factor
+                # 2d. EQ Band parameter (/channels/X/equalizer/bandName/paramName) - num_parts == 6
+                elif num_parts == 6:
+                    if effect_name == 'equalizer': # Ensure it's the EQ path
+                        effect_id = FX_ID_EQ
+                        band_name = parts[3]  # e.g., lowShelf, band0
+                        # parts[4] would be the specific metric ('gain_db', 'cutoff_freq', 'q_factor')
+                        # This structure differs slightly from schema, need param name from parts[4] maybe?
+                        # Let's re-check schema path vs patch path:
+                        # Patch path: /channels/X/equalizer/bandName/gain_db (example) -> num_parts = 5 ???
+                        # If patch path IS /channels/X/equalizer/bandName/PARAM/value (num_parts=6),
+                        # need to rethink. Schema shows structure like:
+                        # equalizer: { enabled: bool, lowShelf: { gain_db: X, ... }, band0: { gain_db: Y, ... } }
+                        # A patch for lowShelf gain would be: /channels/X/equalizer/lowShelf/gain_db
+                        # THIS HAS 5 PARTS, not 6! Let's adjust the logic above.
 
-                    # Map band/param name to single EQ param_id
-                    if band_name == 'lowShelf':
-                        if param_name == 'gain_db': param_id = PARAM_ID_EQ_LS_GAIN; valid_command = True
-                        elif param_name == 'cutoff_freq': param_id = PARAM_ID_EQ_LS_FREQ; valid_command = True
-                        elif param_name == 'q_factor': param_id = PARAM_ID_EQ_LS_Q; valid_command = True
-                    elif band_name == 'highShelf':
-                        if param_name == 'gain_db': param_id = PARAM_ID_EQ_HS_GAIN; valid_command = True
-                        elif param_name == 'cutoff_freq': param_id = PARAM_ID_EQ_HS_FREQ; valid_command = True
-                        elif param_name == 'q_factor': param_id = PARAM_ID_EQ_HS_Q; valid_command = True
-                    elif band_name == 'band0':
-                        if param_name == 'gain_db': param_id = PARAM_ID_EQ_B0_GAIN; valid_command = True
-                        elif param_name == 'cutoff_freq': param_id = PARAM_ID_EQ_B0_FREQ; valid_command = True
-                        elif param_name == 'q_factor': param_id = PARAM_ID_EQ_B0_Q; valid_command = True
-                    elif band_name == 'band1':
-                        if param_name == 'gain_db': param_id = PARAM_ID_EQ_B1_GAIN; valid_command = True
-                        elif param_name == 'cutoff_freq': param_id = PARAM_ID_EQ_B1_FREQ; valid_command = True
-                        elif param_name == 'q_factor': param_id = PARAM_ID_EQ_B1_Q; valid_command = True
-                    elif band_name == 'band2':
-                        if param_name == 'gain_db': param_id = PARAM_ID_EQ_B2_GAIN; valid_command = True
-                        elif param_name == 'cutoff_freq': param_id = PARAM_ID_EQ_B2_FREQ; valid_command = True
-                        elif param_name == 'q_factor': param_id = PARAM_ID_EQ_B2_Q; valid_command = True
-                    elif band_name == 'band3':
-                        if param_name == 'gain_db': param_id = PARAM_ID_EQ_B3_GAIN; valid_command = True
-                        elif param_name == 'cutoff_freq': param_id = PARAM_ID_EQ_B3_FREQ; valid_command = True
-                        elif param_name == 'q_factor': param_id = PARAM_ID_EQ_B3_Q; valid_command = True
+                        # ---->>> REVISED LOGIC BASED ON 5 PARTS FOR EQ PARAMS <<<----
+                        # THIS SECTION IS MOVED INTO num_parts == 5 block logic
+
+                    # else: No other known paths have 6 parts
+
+            # --- Let's RE-TRY the num_parts == 5 logic including EQ ---
+            if num_parts == 5:
+                 effect_name = parts[2]
+                 sub_name = parts[3] # This could be the param (comp) OR band name (eq)
+                 param_name = parts[4] # This is the actual param (comp) OR metric (eq)
+
+                 if effect_name == 'equalizer':
+                     effect_id = FX_ID_EQ
+                     band_name = sub_name # Index 3 is band name
+                     metric_name = param_name # Index 4 is gain/freq/q
+                     # Map band/metric name to single EQ param_id
+                     if band_name == 'lowShelf':
+                         if metric_name == 'gain_db': param_id = PARAM_ID_EQ_LS_GAIN; valid_command = True
+                         elif metric_name == 'cutoff_freq': param_id = PARAM_ID_EQ_LS_FREQ; valid_command = True
+                         elif metric_name == 'q_factor': param_id = PARAM_ID_EQ_LS_Q; valid_command = True
+                     elif band_name == 'highShelf':
+                         if metric_name == 'gain_db': param_id = PARAM_ID_EQ_HS_GAIN; valid_command = True
+                         elif metric_name == 'cutoff_freq': param_id = PARAM_ID_EQ_HS_FREQ; valid_command = True
+                         elif metric_name == 'q_factor': param_id = PARAM_ID_EQ_HS_Q; valid_command = True
+                     elif band_name == 'band0':
+                         if metric_name == 'gain_db': param_id = PARAM_ID_EQ_B0_GAIN; valid_command = True
+                         elif metric_name == 'cutoff_freq': param_id = PARAM_ID_EQ_B0_FREQ; valid_command = True
+                         elif metric_name == 'q_factor': param_id = PARAM_ID_EQ_B0_Q; valid_command = True
+                     elif band_name == 'band1':
+                         if metric_name == 'gain_db': param_id = PARAM_ID_EQ_B1_GAIN; valid_command = True
+                         elif metric_name == 'cutoff_freq': param_id = PARAM_ID_EQ_B1_FREQ; valid_command = True
+                         elif metric_name == 'q_factor': param_id = PARAM_ID_EQ_B1_Q; valid_command = True
+                     elif band_name == 'band2':
+                         if metric_name == 'gain_db': param_id = PARAM_ID_EQ_B2_GAIN; valid_command = True
+                         elif metric_name == 'cutoff_freq': param_id = PARAM_ID_EQ_B2_FREQ; valid_command = True
+                         elif metric_name == 'q_factor': param_id = PARAM_ID_EQ_B2_Q; valid_command = True
+                     elif band_name == 'band3':
+                         if metric_name == 'gain_db': param_id = PARAM_ID_EQ_B3_GAIN; valid_command = True
+                         elif metric_name == 'cutoff_freq': param_id = PARAM_ID_EQ_B3_FREQ; valid_command = True
+                         elif metric_name == 'q_factor': param_id = PARAM_ID_EQ_B3_Q; valid_command = True
+                 elif effect_name == 'compressor':
+                    effect_id = FX_ID_COMP
+                    # For compressor, index 3 is the param name, index 4 doesn't exist in path
+                    # The path is /channels/X/compressor/threshold_db
+                    # So num_parts should be 4 for these parameters... need to rethink structure AGAIN.
+
+            # --- Let's restructure based on known path lengths and map backwards ---
+
+            # Reset before trying again
+            channel_id = 0; effect_id = 0xFF; param_id = 0xFF; valid_command = False;
+
+            if num_parts == 1: # Top-level parameter (e.g., /soloing_active)
+                 param_name = parts[0]
+                 param_id = PARAM_ID_TOPLEVEL_BOOL
+                 effect_id = 0 # N/A
+                 if param_name == 'soloing_active': channel_id = CH_ID_SOLOING_ACTIVE; valid_command = True
+                 elif param_name == 'inferencing_active': channel_id = CH_ID_INFERENCING_ACTIVE; valid_command = True
+                 elif param_name == 'hw_init_ready': channel_id = CH_ID_HW_INIT_READY; valid_command = True
+
+            elif num_parts >= 3 and parts[0] == 'channels':
+                 channel_id = int(parts[1])
+                 if not (0 <= channel_id <= 8): raise ValueError(f"Invalid channel index: {channel_id}")
+
+                 if num_parts == 3: # Direct channel parameter (/channels/X/paramName)
+                     effect_id = FX_ID_DIRECT
+                     param_name = parts[2]
+                     if param_name == 'muted': param_id = PARAM_ID_DIRECT_MUTED; valid_command = True
+                     elif param_name == 'soloed': param_id = PARAM_ID_DIRECT_SOLOED; valid_command = True
+                     elif param_name == 'panning': param_id = PARAM_ID_DIRECT_PANNING; valid_command = True
+                     elif param_name == 'digital_gain': param_id = PARAM_ID_DIRECT_DIGITAL_GAIN; valid_command = True
+                     elif param_name == 'analog_gain': param_id = PARAM_ID_DIRECT_ANALOG_GAIN; valid_command = True
+                     elif param_name == 'stereo': param_id = PARAM_ID_DIRECT_STEREO; valid_command = True
+
+                 elif num_parts == 4: # Effect enable OR Comp/Dist/Phaser/Reverb Param (/channels/X/effect/param)
+                     effect_name = parts[2]
+                     param_name = parts[3]
+
+                     if param_name == 'enabled': # Check for enable first
+                         if effect_name == 'equalizer': effect_id = FX_ID_EQ; param_id = PARAM_ID_EQ_ENABLED; valid_command = True
+                         elif effect_name == 'compressor': effect_id = FX_ID_COMP; param_id = PARAM_ID_COMP_ENABLED; valid_command = True
+                         elif effect_name == 'distortion': effect_id = FX_ID_DIST; param_id = PARAM_ID_DIST_ENABLED; valid_command = True
+                         elif effect_name == 'phaser': effect_id = FX_ID_PHASER; param_id = PARAM_ID_PHASER_ENABLED; valid_command = True
+                         elif effect_name == 'reverb': effect_id = FX_ID_REVERB; param_id = PARAM_ID_REVERB_ENABLED; valid_command = True
+                     else: # If not 'enabled', it must be a parameter of Comp/Dist/Phaser/Reverb
+                         if effect_name == 'compressor':
+                             effect_id = FX_ID_COMP
+                             if param_name == 'threshold_db': param_id = PARAM_ID_COMP_THRESH; valid_command = True
+                             elif param_name == 'ratio': param_id = PARAM_ID_COMP_RATIO; valid_command = True
+                             elif param_name == 'attack_ms': param_id = PARAM_ID_COMP_ATTACK; valid_command = True
+                             elif param_name == 'release_ms': param_id = PARAM_ID_COMP_RELEASE; valid_command = True
+                             elif param_name == 'knee_db': param_id = PARAM_ID_COMP_KNEE; valid_command = True
+                             elif param_name == 'makeup_gain_db': param_id = PARAM_ID_COMP_MAKEUP; valid_command = True
+                         elif effect_name == 'distortion':
+                             effect_id = FX_ID_DIST
+                             if param_name == 'drive': param_id = PARAM_ID_DIST_DRIVE; valid_command = True
+                             elif param_name == 'output_gain_db': param_id = PARAM_ID_DIST_OUTPUT; valid_command = True
+                         elif effect_name == 'phaser':
+                             effect_id = FX_ID_PHASER
+                             if param_name == 'rate': param_id = PARAM_ID_PHASER_RATE; valid_command = True
+                             elif param_name == 'depth': param_id = PARAM_ID_PHASER_DEPTH; valid_command = True
+                         elif effect_name == 'reverb':
+                             effect_id = FX_ID_REVERB
+                             if param_name == 'decay_time': param_id = PARAM_ID_REVERB_DECAY; valid_command = True
+                             elif param_name == 'wet_level': param_id = PARAM_ID_REVERB_WET; valid_command = True
+
+                 elif num_parts == 5: # EQ Band parameter (/channels/X/equalizer/bandName/paramName)
+                      effect_name = parts[2]
+                      if effect_name == 'equalizer':
+                          effect_id = FX_ID_EQ
+                          band_name = parts[3] # e.g., lowShelf, band0
+                          param_name = parts[4] # e.g., gain_db, cutoff_freq, q_factor
+
+                          if band_name == 'lowShelf':
+                              if param_name == 'gain_db': param_id = PARAM_ID_EQ_LS_GAIN; valid_command = True
+                              elif param_name == 'cutoff_freq': param_id = PARAM_ID_EQ_LS_FREQ; valid_command = True
+                              elif param_name == 'q_factor': param_id = PARAM_ID_EQ_LS_Q; valid_command = True
+                          elif band_name == 'highShelf':
+                              if param_name == 'gain_db': param_id = PARAM_ID_EQ_HS_GAIN; valid_command = True
+                              elif param_name == 'cutoff_freq': param_id = PARAM_ID_EQ_HS_FREQ; valid_command = True
+                              elif param_name == 'q_factor': param_id = PARAM_ID_EQ_HS_Q; valid_command = True
+                          elif band_name == 'band0':
+                              if param_name == 'gain_db': param_id = PARAM_ID_EQ_B0_GAIN; valid_command = True
+                              elif param_name == 'cutoff_freq': param_id = PARAM_ID_EQ_B0_FREQ; valid_command = True
+                              elif param_name == 'q_factor': param_id = PARAM_ID_EQ_B0_Q; valid_command = True
+                          elif band_name == 'band1':
+                              if param_name == 'gain_db': param_id = PARAM_ID_EQ_B1_GAIN; valid_command = True
+                              elif param_name == 'cutoff_freq': param_id = PARAM_ID_EQ_B1_FREQ; valid_command = True
+                              elif param_name == 'q_factor': param_id = PARAM_ID_EQ_B1_Q; valid_command = True
+                          elif band_name == 'band2':
+                              if param_name == 'gain_db': param_id = PARAM_ID_EQ_B2_GAIN; valid_command = True
+                              elif param_name == 'cutoff_freq': param_id = PARAM_ID_EQ_B2_FREQ; valid_command = True
+                              elif param_name == 'q_factor': param_id = PARAM_ID_EQ_B2_Q; valid_command = True
+                          elif band_name == 'band3':
+                              if param_name == 'gain_db': param_id = PARAM_ID_EQ_B3_GAIN; valid_command = True
+                              elif param_name == 'cutoff_freq': param_id = PARAM_ID_EQ_B3_FREQ; valid_command = True
+                              elif param_name == 'q_factor': param_id = PARAM_ID_EQ_B3_Q; valid_command = True
 
             # --- Encode Value and Queue Command ---
             if valid_command:
                 encoded_value = encode_value(value)
                 i2c_message_bytes = struct.pack('<IIII', channel_id, effect_id, param_id, encoded_value)
-                try:
-                    # Put the command onto the queue asynchronously
-                    await i2c_command_queue.put(i2c_message_bytes)
-                    commands_generated += 1
-                    logging.debug(f"Queued I2C Cmd: Path='{path}' -> Chan={channel_id}, Fx={effect_id}, Param={param_id}, EncVal={encoded_value} -> Bytes={list(i2c_message_bytes)}")
-                except asyncio.QueueFull:
-                     # Should not happen with default unbounded queue, but good practice
-                     logging.error("I2C command queue is unexpectedly full!")
-                except Exception as qe:
-                     logging.error(f"Error putting command onto I2C queue: {qe}")
-
+                await i2c_command_queue.put(i2c_message_bytes)
+                commands_generated += 1
+                logging.debug(f"Queued I2C Cmd: Path='{path}' -> Chan={channel_id}, Fx={effect_id}, Param={param_id}, EncVal=0x{encoded_value:08X}")
             else:
-                 # Only log if it wasn't just an unhandled path (like intermediate objects)
-                 # This might be noisy, adjust logging level if needed
-                 # logging.warning(f"Could not map path to I2C command: {path}")
-                 pass
+                # Improved logging for unmapped paths
+                is_intermediate_effect_path = (num_parts == 3 and parts[2] in ['equalizer', 'compressor', 'distortion', 'phaser', 'reverb'])
+                is_intermediate_band_path = (num_parts == 4 and parts[2] == 'equalizer' and parts[3] in ['lowShelf', 'highShelf', 'band0', 'band1', 'band2', 'band3']) # Check intermediate band path
+                if not is_intermediate_effect_path and not is_intermediate_band_path and path != '/inferencing_state':
+                     logging.warning(f"Could not map path/value to I2C command: {path} = {value}")
 
         except (ValueError, IndexError, TypeError) as e:
             logging.error(f"Error parsing path or value for I2C command: {path} - {e}")
         except Exception as e:
-            logging.error(f"Unexpected error encoding I2C command for path {path}: {e}")
+            logging.error(f"Unexpected error encoding I2C command for path {path}: {e}", exc_info=True)
 
     if commands_generated > 0:
         logging.debug(f"Queued {commands_generated} I2C command(s) resulting from patch.")
+# --- End send_to_stm32 ---
 
 
 
